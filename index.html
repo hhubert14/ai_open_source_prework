@@ -8,6 +8,7 @@
 </head>
 <body>
   <canvas id="world-canvas" aria-label="World map canvas"></canvas>
+  <div id="hud" aria-live="polite" style="position:fixed;left:8px;top:8px;color:#0f0;background:rgba(0,0,0,0.45);padding:6px 8px;border-radius:4px;font:12px/16px monospace;z-index:10;user-select:none;">Connecting…</div>
 
   <script>
     (function() {
@@ -38,6 +39,13 @@
 
       // Redraw control
       let needsRedraw = true;
+
+      // HUD / FPS tracking
+      const hudEl = document.getElementById('hud');
+      let frameCount = 0;
+      let fps = 0;
+      let lastFpsUpdate = performance.now();
+      let connectionStatus = 'connecting';
 
       function clamp(value, min, max) {
         if (value < min) return min;
@@ -172,10 +180,22 @@
         for (const p of visible) {
           drawPlayer(p);
         }
+        // HUD updates every frame count; draw is via DOM text update
+        frameCount++;
       }
 
       function rafLoop() {
         render();
+        const now = performance.now();
+        if (now - lastFpsUpdate >= 1000) {
+          fps = frameCount;
+          frameCount = 0;
+          lastFpsUpdate = now;
+          if (hudEl) {
+            const statusText = connectionStatus === 'open' ? 'Connected' : connectionStatus === 'connecting' ? 'Connecting…' : connectionStatus === 'closed' ? 'Disconnected' : String(connectionStatus);
+            hudEl.textContent = `FPS: ${fps} | ${statusText}`;
+          }
+        }
         requestAnimationFrame(rafLoop);
       }
 
@@ -225,18 +245,23 @@
         try {
           websocket = new WebSocket('wss://codepath-mmorg.onrender.com');
           websocket.addEventListener('open', function() {
+            connectionStatus = 'open';
+            if (hudEl) hudEl.textContent = 'Connected';
             const join = { action: 'join_game', username: 'Hubert' };
             websocket.send(JSON.stringify(join));
           });
           websocket.addEventListener('message', handleMessage);
           websocket.addEventListener('error', function(err) {
             console.warn('WebSocket error', err);
+            connectionStatus = 'error';
           });
           websocket.addEventListener('close', function() {
             // Optional: retry logic could be added here
+            connectionStatus = 'closed';
           });
         } catch (e) {
           console.warn('Failed to connect to server', e);
+          connectionStatus = 'error';
         }
       }
 
