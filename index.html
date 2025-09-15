@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MMORPG World Viewer</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <canvas id="world-canvas" aria-label="World map canvas"></canvas>
+
+  <script>
+    (function() {
+      const canvas = document.getElementById('world-canvas');
+      const ctx = canvas.getContext('2d', { alpha: false });
+
+      // Rendering config
+      ctx.imageSmoothingEnabled = false;
+
+      // World map image
+      const worldImage = new Image();
+      worldImage.src = 'world.jpg';
+
+      // State
+      let isWorldLoaded = false;
+      let worldWidth = 0;
+      let worldHeight = 0;
+      let viewportWidth = 0;
+      let viewportHeight = 0;
+      let cameraX = 0;
+      let cameraY = 0;
+
+      // Game state from server
+      let websocket = null;
+      let myPlayerId = null;
+      let players = {}; // id -> player
+      const avatarFramesCache = new Map(); // key: avatarName -> { north: Image[], south: Image[], east: Image[], west: Image[] }
+
+      // Redraw control
+      let needsRedraw = true;
+
+      function clamp(value, min, max) {
+        if (value < min) return min;
+        if (value > max) return max;
+        return value;
+      }
+
+      function sizeCanvasToWindow() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        viewportWidth = canvas.width;
+        viewportHeight = canvas.height;
+        needsRedraw = true;
+        updateCamera();
+      }
+
+      function updateCamera() {
+        if (!myPlayerId || !players[myPlayerId] || !isWorldLoaded) return;
+        const me = players[myPlayerId];
+        const desiredX = me.x - Math.floor(viewportWidth / 2);
+        const desiredY = me.y - Math.floor(viewportHeight / 2);
+        const maxX = Math.max(0, worldWidth - viewportWidth);
+        const maxY = Math.max(0, worldHeight - viewportHeight);
+        const newCameraX = clamp(desiredX, 0, maxX);
+        const newCameraY = clamp(desiredY, 0, maxY);
+        if (newCameraX !== cameraX || newCameraY !== cameraY) {
+          cameraX = newCameraX;
+          cameraY = newCameraY;
+          needsRedraw = true;
+        }
+      }
+
+      function ensureAvatarCached(avatar) {
+        if (!avatar || !avatar.name || !avatar.frames) return null;
+        if (avatarFramesCache.has(avatar.name)) return avatarFramesCache.get(avatar.name);
+
+        const directions = ['north', 'south', 'east'];
+        const cached = { north: [], south: [], east: [], west: [] };
+        for (const dir of directions) {
+          const frames = avatar.frames[dir] || [];
+          cached[dir] = frames.map(src => {
+            const img = new Image();
+            img.src = src;
+            img.decode?.().catch(() => {});
+            return img;
+          });
+        }
+        // Precompute west by marking need for flip at draw-time; optional pre-rendering could be added later
+        cached.west = cached.east; // We'll draw flipped for west
+
+        avatarFramesCache.set(avatar.name, cached);
+        return cached;
+      }
+
+      function drawWorldSlice() {
+        if (!isWorldLoaded) return;
+        const sx = cameraX;
+        const sy = cameraY;
+        const sWidth = Math.min(viewportWidth, worldWidth - sx);
+        const sHeight = Math.min(viewportHeight, worldHeight - sy);
+        const dx = 0;
+        const dy = 0;
+        const dWidth = sWidth;
+        const dHeight = sHeight;
+        ctx.clearRect(0, 0, viewportWidth, viewportHeight);
+        ctx.drawImage(worldImage, sx, sy, sWidth, sHeight, dx, dy, dWidth, dHeight);
+      }
+
+      function drawPlayer(player) {
+        if (!player || !player.avatar) return;
+        const cached = avatarFramesCache.get(player.avatar);
+        if (!cached) return;
+        const dir = player.facing || 'south';
+        const frameIndex = typeof player.animationFrame === 'number' ? player.animationFrame : 0;
+        let frameList = cached[dir];
+        if (!frameList || frameList.length === 0) frameList = cached['south'];
+        const frame = frameList[frameIndex % frameList.length];
+        if (!frame || !frame.width || !frame.height) return;
+
+        const screenX = Math.round(player.x - cameraX);
+        const screenY = Math.round(player.y - cameraY);
+
+        const drawX = Math.round(screenX - frame.width / 2);
+        const drawY = Math.round(screenY - frame.height);
+
+        if (dir === 'west') {
+          ctx.save();
+          ctx.translate(Math.round(screenX), 0);
+          ctx.scale(-1, 1);
+          ctx.drawImage(frame, Math.round(-frame.width / 2), drawY);
+          ctx.restore();
+        } else {
+          ctx.drawImage(frame, drawX, drawY);
+        }
+
+        // Username label
+        const username = player.username || '';
+        if (username) {
+          ctx.font = '14px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'bottom';
+          ctx.fillStyle = '#ffffff';
+          ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+          ctx.lineWidth = 3;
+          const labelX = screenX;
+          const labelY = drawY - 4;
+          ctx.strokeText(username, labelX, labelY);
+          ctx.fillText(username, labelX, labelY);
+        }
+      }
+
+      function render() {
+        if (!needsRedraw) return;
+        needsRedraw = false;
+        drawWorldSlice();
+
+        // Build visible list of players
+        const visible = [];
+        for (const id in players) {
+          const p = players[id];
+          if (!p || !p.avatar) continue;
+          const sx = p.x - cameraX;
+          const sy = p.y - cameraY;
+          // Simple culling: keep if within a padded viewport (padding helps with tall sprites)
+          const padding = 128;
+          if (sx >= -padding && sx <= viewportWidth + padding && sy >= -padding && sy <= viewportHeight + padding) {
+            visible.push(p);
+          }
+        }
+        // Sort by y for sensible overlap (back-to-front)
+        visible.sort((a, b) => a.y - b.y);
+        for (const p of visible) {
+          drawPlayer(p);
+        }
+      }
+
+      function rafLoop() {
+        render();
+        requestAnimationFrame(rafLoop);
+      }
+
+      function handleMessage(evt) {
+        try {
+          const msg = JSON.parse(evt.data);
+          if (msg.action === 'join_game' && msg.success) {
+            myPlayerId = msg.playerId;
+            players = msg.players || {};
+            // Cache avatars
+            const avatars = msg.avatars || {};
+            for (const name in avatars) {
+              const avatar = avatars[name];
+              ensureAvatarCached(avatar);
+            }
+            // Update camera now that we have my position
+            updateCamera();
+            needsRedraw = true;
+          } else if (msg.action === 'players_moved' && msg.players) {
+            // For future updates; minimally merge my player to keep camera in sync if needed
+            let cameraMightChange = false;
+            for (const id in msg.players) {
+              const p = msg.players[id];
+              if (players[id]) {
+                players[id] = { ...players[id], ...p };
+              } else {
+                players[id] = p;
+              }
+              if (id === myPlayerId) cameraMightChange = true;
+            }
+            if (cameraMightChange) updateCamera();
+            needsRedraw = true;
+          } else if (msg.action === 'player_joined' && msg.player) {
+            players[msg.player.id] = msg.player;
+            if (msg.avatar) ensureAvatarCached(msg.avatar);
+          } else if (msg.action === 'player_left' && msg.playerId) {
+            delete players[msg.playerId];
+          } else if (msg.success === false) {
+            console.warn('Server error:', msg.error);
+          }
+        } catch (e) {
+          console.warn('Invalid message from server', e);
+        }
+      }
+
+      function connect() {
+        try {
+          websocket = new WebSocket('wss://codepath-mmorg.onrender.com');
+          websocket.addEventListener('open', function() {
+            const join = { action: 'join_game', username: 'Hubert' };
+            websocket.send(JSON.stringify(join));
+          });
+          websocket.addEventListener('message', handleMessage);
+          websocket.addEventListener('error', function(err) {
+            console.warn('WebSocket error', err);
+          });
+          websocket.addEventListener('close', function() {
+            // Optional: retry logic could be added here
+          });
+        } catch (e) {
+          console.warn('Failed to connect to server', e);
+        }
+      }
+
+      function handleResize() {
+        sizeCanvasToWindow();
+      }
+
+      // Input handling: Arrow keys
+      const pressedArrows = new Set();
+      const keyToDirection = {
+        ArrowUp: 'up',
+        ArrowDown: 'down',
+        ArrowLeft: 'left',
+        ArrowRight: 'right'
+      };
+
+      function sendMove(direction) {
+        if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
+        websocket.send(JSON.stringify({ action: 'move', direction }));
+      }
+
+      function sendStop() {
+        if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
+        websocket.send(JSON.stringify({ action: 'stop' }));
+      }
+
+      window.addEventListener('keydown', function(e) {
+        const direction = keyToDirection[e.key];
+        if (!direction) return;
+        e.preventDefault();
+        // Track pressed state; allow key repeat to generate additional keydown events
+        pressedArrows.add(direction);
+        // Send a move command on every keydown (including repeats)
+        sendMove(direction);
+        // Optionally update facing for responsiveness
+        if (myPlayerId && players[myPlayerId]) {
+          players[myPlayerId].facing = direction === 'left' ? 'west' : direction === 'right' ? 'east' : direction === 'up' ? 'north' : 'south';
+          needsRedraw = true;
+        }
+      }, { passive: false });
+
+      window.addEventListener('keyup', function(e) {
+        const direction = keyToDirection[e.key];
+        if (!direction) return;
+        e.preventDefault();
+        pressedArrows.delete(direction);
+        if (pressedArrows.size === 0) {
+          sendStop();
+        }
+      }, { passive: false });
+
+      window.addEventListener('blur', function() {
+        if (pressedArrows.size > 0) {
+          pressedArrows.clear();
+          sendStop();
+        }
+      });
+
+      worldImage.addEventListener('load', function() {
+        isWorldLoaded = true;
+        worldWidth = worldImage.naturalWidth || worldImage.width;
+        worldHeight = worldImage.naturalHeight || worldImage.height;
+        updateCamera();
+        needsRedraw = true;
+      });
+
+      window.addEventListener('resize', handleResize);
+
+      // Init
+      sizeCanvasToWindow();
+      connect();
+      rafLoop();
+    })();
+  </script>
+</body>
+</html>
+
+
